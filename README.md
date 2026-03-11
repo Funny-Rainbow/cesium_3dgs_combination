@@ -19,7 +19,8 @@
 4. 运行示例
 网页打开
    ```bash
-   http://localhost:8088/first_start
+   http://localhost:8088/combined_cesium_spark.html
+(需要将学校3dgs文件放置在对应位置，const splatURL = "./assets/3dgs/JNUAerial-with_Park-y_up.sog";)
 
 ---
 ### 如需其他示例，运行以下步骤，但注意将示例文件及文件夹添加到.gitignore中
