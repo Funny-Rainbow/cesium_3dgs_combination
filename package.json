@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@sparkjsdev/spark": "latest",
+    "cesium": "^1.137.0",
+    "server": "^1.0.42",
+    "three": "latest"
+  }
+}

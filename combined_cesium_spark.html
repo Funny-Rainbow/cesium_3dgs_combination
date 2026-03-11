@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Cesium + Spark - 地形影像修复版</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: black;
+    }
+    #cesiumContainer {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+    #loadingInfo {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: white;
+      font-family: Arial, sans-serif;
+      font-size: 18px;
+      background: rgba(0, 0, 0, 0.8);
+      padding: 20px 40px;
+      border-radius: 10px;
+      z-index: 1000;
+      text-align: center;
+    }
+    #controls {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 15px;
+      border-radius: 8px;
+      font-family: Arial, sans-serif;
+      font-size: 14px;
+      max-width: 250px;
+    }
+    #controls button {
+      margin: 5px 0;
+      padding: 8px 15px;
+      width: 100%;
+      background: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    #controls button:hover {
+      background: #45a049;
+    }
+    #controls h3 {
+      margin: 0 0 10px 0;
+      font-size: 16px;
+      border-bottom: 1px solid white;
+      padding-bottom: 5px;
+    }
+    #debug {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px;
+      border-radius: 5px;
+      font-family: monospace;
+      font-size: 12px;
+      max-width: 350px;
+    }
+  </style>
+  <!-- Ensure Cesium can resolve its static assets (Assets/Widgets/Workers) correctly -->
+  <script>
+    // Must be set before loading Cesium.js
+    window.CESIUM_BASE_URL = "./node_modules/cesium/Build/Cesium/";
+  </script>
+  <!-- Cesium CSS from local node_modules -->
+  <link href="./node_modules/cesium/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+</head>
+<body>
+  <div id="loadingInfo">正在加载地形、影像和建筑数据...</div>
+  <div id="cesiumContainer"></div>
+  <div id="controls">
+    <h3>📍 场景切换</h3>
+    <button onclick="flyToSplat()">3DGS 模型</button>
+    <button onclick="flyToSanFrancisco()">旧金山 (建筑)</button>
+    <button onclick="flyToGrandCanyon()">大峡谷 (地形)</button>
+    <button onclick="flyToEverest()">珠穆朗玛峰</button>
+    <button onclick="flyToAlps()">瑞士阿尔卑斯山</button>
+    <button onclick="flyToNewYork()">纽约 (建筑)</button>
+    <button onclick="toggleLighting()">切换光照</button>
+    <button onclick="cycleImagery()">切换影像源(国内/国外)</button>
+    <button onclick="cycleTerrain()">切换地形源(国内/国外)</button>
+  </div>
+  <div id="debug">调试信息加载中...</div>
+
+  <!-- Load Cesium from local node_modules -->
+  <script src="./node_modules/cesium/Build/Cesium/Cesium.js"></script>
+  
+  <!-- Import map for Spark and Three.js -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./node_modules/three/build/three.module.js",
+        "@sparkjsdev/spark": "./node_modules/@sparkjsdev/spark/dist/spark.module.js"
+      }
+    }
+  </script>
+  
+  <!-- Main application script -->
+  <script type="module">
+    let viewer; // Global viewer reference for button controls
+    let currentImageryIndex = 0;
+    let currentTerrainIndex = 0;
+    window.flyToSplat = undefined; // Will be assigned after Spark init
+
+    // ---- 国内源优先配置（按需改这里即可）----
+    // 说明：国内 XYZ 瓦片大多是 WebMercator(EPSG:3857)，Cesium 可直接使用。
+    // 注意：高德/腾讯等底图为 GCJ-02，在中国境内会与 WGS84 有偏移（属正常现象）。
+    const CN_SUBDOMAINS_1_4 = ["1", "2", "3", "4"];
+    const CN_IMAGERY_SOURCES = [
+      {
+        name: "高德影像(国内)",
+        create: () =>
+          new Cesium.UrlTemplateImageryProvider({
+            url: "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
+            subdomains: CN_SUBDOMAINS_1_4,
+            tilingScheme: new Cesium.WebMercatorTilingScheme(),
+            maximumLevel: 19,
+            credit: new Cesium.Credit("© AMap")
+          })
+      },
+      {
+        name: "高德矢量(国内)",
+        create: () =>
+          new Cesium.UrlTemplateImageryProvider({
+            url: "https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}",
+            subdomains: CN_SUBDOMAINS_1_4,
+            tilingScheme: new Cesium.WebMercatorTilingScheme(),
+            maximumLevel: 19,
+            credit: new Cesium.Credit("© AMap")
+          })
+      },
+      {
+        name: "OSM(国外备用)",
+        create: () =>
+          new Cesium.OpenStreetMapImageryProvider({
+            url: "https://a.tile.openstreetmap.org/"
+          })
+      },
+      {
+        // Cesium ion 资产：Google Maps 2D Satellite (asset id: 3830182)
+        // 需要 ion token 且账号需具备对应权限；失败会在控制台报错。
+        name: "Google Maps 2D Satellite(ion)",
+        create: async () => {
+          if (ION_TOKEN && typeof ION_TOKEN === "string") {
+            Cesium.Ion.defaultAccessToken = ION_TOKEN;
+          }
+          if (!Cesium?.IonImageryProvider?.fromAssetId) {
+            throw new Error("Cesium.IonImageryProvider.fromAssetId not available");
+          }
+          return await Cesium.IonImageryProvider.fromAssetId(3830182);
+        }
+      }
+    ];
+
+    // 国内公开的 CesiumTerrain（示例）：Mars3D 公共地形。
+    // 如果你有自己的地形服务，优先改成你自己的内网/国内 CDN 地址。
+    const CN_TERRAIN_URL =
+      location.protocol === "https:"
+        ? "https://data.mars3d.cn/terrain"
+        : "http://data.mars3d.cn/terrain";
+
+    // 国外地形（Cesium World Terrain）通常需要 ion token；只有切换到国外地形时才会用到。
+    // 如果你有自己的 ion token，可替换这里；留空会导致国外地形切换失败，但国内地形仍可用。
+    const ION_TOKEN =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJjMWE2MjYxOS03OGFiLTQ2YTQtYTljYy0xYTZiZTQ3Y2M5OTQiLCJpZCI6MzExODA0LCJpYXQiOjE3Njk3NDI4NzV9.bExrsH6Sqxff3AQp66VVBgraRKgi0pnNi6hgbkF30zQ";
+
+    // OSM Buildings 走 Cesium ion（国内通常较慢/不稳定），默认关闭。
+    const ENABLE_OSM_BUILDINGS = false;
+
+    // Wait for Cesium to be available
+    function waitForCesium() {
+      return new Promise((resolve) => {
+        if (typeof Cesium !== 'undefined') {
+          resolve();
+        } else {
+          const checkInterval = setInterval(() => {
+            if (typeof Cesium !== 'undefined') {
+              clearInterval(checkInterval);
+              resolve();
+            }
+          }, 100);
+        }
+      });
+    }
+
+    function updateDebugInfo() {
+      const debug = document.getElementById('debug');
+      if (viewer && debug) {
+        const globe = viewer.scene.globe;
+        const scene = viewer.scene;
+        const layers = viewer.imageryLayers;
+        const baseLayer = layers.length > 0 ? layers.get(0) : null;
+        const terrainProvider = viewer.terrainProvider;
+        
+        debug.innerHTML = `
+          光照启用: ${globe.enableLighting ? '✓' : '✗'}<br>
+          影像图层数: ${layers.length}<br>
+          当前影像: ${CN_IMAGERY_SOURCES[currentImageryIndex]?.name ?? 'N/A'}<br>
+          基础图层就绪: ${baseLayer && baseLayer.ready ? '✓' : '✗'}<br>
+          基础图层透明度: ${baseLayer ? baseLayer.alpha.toFixed(2) : 'N/A'}<br>
+          当前地形: ${currentTerrainIndex === 0 ? '国内' : '国外'}<br>
+          地形提供者: ${terrainProvider ? '✓' : '✗'}<br>
+          场景模式: ${scene.mode}
+        `;
+      }
+    }
+
+    async function createImageryProvider(source) {
+      const providerOrPromise = source.create();
+      if (providerOrPromise && typeof providerOrPromise.then === "function") {
+        return await providerOrPromise;
+      }
+      return providerOrPromise;
+    }
+
+    async function createWorldTerrainProvider() {
+      if (ION_TOKEN && typeof ION_TOKEN === "string") {
+        Cesium.Ion.defaultAccessToken = ION_TOKEN;
+      }
+
+      if (typeof Cesium.createWorldTerrainAsync === "function") {
+        return await Cesium.createWorldTerrainAsync({
+          requestVertexNormals: true,
+          requestWaterMask: false
+        });
+      }
+      if (typeof Cesium.createWorldTerrain === "function") {
+        return Cesium.createWorldTerrain({
+          requestVertexNormals: true,
+          requestWaterMask: false
+        });
+      }
+
+      throw new Error("World Terrain API not available");
+    }
+
+    async function createCnTerrainProvider() {
+      if (!Cesium?.CesiumTerrainProvider?.fromUrl) {
+        throw new Error("CesiumTerrainProvider.fromUrl not available");
+      }
+
+      return await Cesium.CesiumTerrainProvider.fromUrl(CN_TERRAIN_URL, {
+        requestVertexNormals: true,
+        requestWaterMask: false
+      });
+    }
+
+    const TERRAIN_SOURCES = [
+      {
+        name: "国内地形(Mars3D)",
+        create: async () => await createCnTerrainProvider()
+      },
+      {
+        name: "国外地形(World Terrain)",
+        create: async () => await createWorldTerrainProvider()
+      }
+    ];
+
+    function setBaseImageryProvider(provider) {
+      if (!viewer) return;
+      const layers = viewer.imageryLayers;
+      if (layers.length > 0) {
+        layers.remove(layers.get(0), true);
+      }
+      const newLayer = layers.addImageryProvider(provider, 0);
+      newLayer.alpha = 1.0;
+      newLayer.brightness = 1.0;
+      newLayer.contrast = 1.2;
+      return newLayer;
+    }
+
+    async function setTerrainByIndex(index) {
+      if (!viewer) return;
+
+      const selected = TERRAIN_SOURCES[index];
+      console.log("Switching terrain to:", selected?.name);
+
+      try {
+        const terrainProvider = await selected.create();
+        viewer.terrainProvider = terrainProvider;
+        currentTerrainIndex = index;
+        console.log("✓ Terrain switched to", selected.name);
+        updateDebugInfo();
+      } catch (error) {
+        console.error("Failed to switch terrain:", selected?.name, error);
+        // Fallback to ellipsoid to keep rendering usable
+        viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+        updateDebugInfo();
+      }
+    }
+
+    async function initCesium() {
+      console.log('🌍 Initializing Cesium...');
+      
+      // Imagery: prefer domestic sources to speed up loading in CN networks.
+      console.log('📷 Loading imagery provider...');
+      const imageryProvider = await createImageryProvider(CN_IMAGERY_SOURCES[0]);
+      currentImageryIndex = 0;
+
+      // Terrain: prefer domestic CesiumTerrain provider, fallback to ellipsoid.
+      console.log('⛰️ Loading terrain provider...');
+      let terrainProvider;
+      try {
+        terrainProvider = await TERRAIN_SOURCES[0].create();
+        currentTerrainIndex = 0;
+        console.log("✓ CN terrain loaded:", CN_TERRAIN_URL);
+      } catch (error) {
+        console.warn('⚠️ CN terrain failed, falling back to ellipsoid:', error);
+        terrainProvider = new Cesium.EllipsoidTerrainProvider();
+      }
+
+      // Create the viewer with proper configuration
+      viewer = new Cesium.Viewer('cesiumContainer', {
+        terrainProvider,
+        
+        // 使用预先加载的影像提供者
+        imageryProvider: imageryProvider,
+        
+        sceneMode: Cesium.SceneMode.SCENE3D,
+        
+        // 基础设置
+        requestRenderMode: false,
+        maximumRenderTimeChange: Infinity,
+        
+        // Disable UI elements
+        baseLayerPicker: false,
+        fullscreenButton: false,
+        vrButton: false,
+        geocoder: false,
+        homeButton: false,
+        infoBox: false,
+        sceneModePicker: false,
+        selectionIndicator: false,
+        timeline: false,
+        navigationHelpButton: false,
+        animation: false,
+        
+        // WebGL options
+        contextOptions: {
+          webgl: {
+            alpha: false,
+            depth: true,
+            stencil: true,
+            antialias: true,
+            powerPreference: "high-performance",
+            premultipliedAlpha: true
+          }
+        }
+      });
+
+      console.log('✓ Viewer created successfully');
+
+      // Defensive: keep Cesium rendering continuously so postRender-based 3DGS stays visible
+      viewer.useDefaultRenderLoop = true;
+      viewer.scene.requestRenderMode = false;
+      viewer.scene.maximumRenderTimeChange = Infinity;
+
+      // 关键配置：确保影像正确显示
+      const globe = viewer.scene.globe;
+      // 默认关闭光照，避免出现“发蓝/发黑”的观感；需要时可用按钮再打开
+      globe.enableLighting = false;
+      globe.depthTestAgainstTerrain = true;
+      globe.tileCacheSize = 1000;
+      globe.showWaterEffect = false; // 禁用水面效果，避免蓝色
+      
+      // 确保基础影像图层完全不透明
+      const layers = viewer.imageryLayers;
+      if (layers.length > 0) {
+        const baseLayer = layers.get(0);
+        baseLayer.alpha = 1.0;
+        baseLayer.brightness = 1.0;
+        baseLayer.contrast = 1.2; // 提高对比度
+        baseLayer.gamma = 1.0;
+        baseLayer.saturation = 1.0;
+        baseLayer.hue = 0.0;
+        
+        console.log('✓ Base imagery layer configured');
+        console.log('  - Alpha:', baseLayer.alpha);
+        console.log('  - Ready:', baseLayer.ready);
+        console.log('  - Show:', baseLayer.show);
+      }
+      
+      // 设置太阳光照
+      const currentDate = new Date();
+      currentDate.setHours(12, 0, 0); // 设置为中午，光照最佳
+      viewer.clock.currentTime = Cesium.JulianDate.fromDate(currentDate);
+      
+      globe.lightingFadeOutDistance = 6500000.0;
+      globe.lightingFadeInDistance = 9000000.0;
+      globe.nightFadeOutDistance = 10000000.0;
+      globe.nightFadeInDistance = 50000000.0;
+      
+      // Set screen space camera controller settings
+      viewer.scene.screenSpaceCameraController.minimumZoomDistance = 10;
+      viewer.scene.screenSpaceCameraController.maximumZoomDistance = 50000000;
+
+      // 启用其他视觉特性
+      viewer.scene.highDynamicRange = true;
+      viewer.scene.fog.enabled = true;
+      viewer.scene.fog.density = 0.0002;
+
+      // 强制渲染几帧以确保影像加载
+      for (let i = 0; i < 10; i++) {
+        viewer.scene.render();
+      }
+
+      // OSM Buildings（ion）默认关闭：国内网络通常很慢/不稳定
+      if (ENABLE_OSM_BUILDINGS) {
+        try {
+          console.log('🏢 Loading OSM Buildings...');
+          const buildingTileset = await Cesium.createOsmBuildingsAsync();
+          
+          buildingTileset.style = new Cesium.Cesium3DTileStyle({
+            color: "color('#FFFFFF', 1.0)",
+            show: true
+          });
+          
+          viewer.scene.primitives.add(buildingTileset);
+          console.log('✓ OSM Buildings loaded successfully');
+        } catch (error) {
+          console.error('❌ Failed to load OSM Buildings:', error);
+        }
+      } else {
+        console.log("ℹ️ OSM Buildings disabled (ENABLE_OSM_BUILDINGS=false)");
+      }
+
+      // Add location markers
+      addLocationMarkers(viewer);
+
+      // Update debug info periodically
+      setInterval(updateDebugInfo, 1000);
+
+      // 监听影像图层加载事件
+      layers.layerAdded.addEventListener((layer) => {
+        console.log('✓ Imagery layer added:', layer);
+        updateDebugInfo();
+      });
+
+      // Hide loading indicator
+      setTimeout(() => {
+        const loadingInfo = document.getElementById('loadingInfo');
+        if (loadingInfo) {
+          loadingInfo.style.display = 'none';
+        }
+        updateDebugInfo();
+      }, 2000);
+
+      console.log('✓ Cesium initialization completed');
+      console.log('Imagery layers:', layers.length);
+      console.log('Base layer show:', layers.get(0)?.show);
+      
+      return viewer;
+    }
+
+    function addLocationMarkers(viewer) {
+      // San Francisco marker
+      viewer.entities.add({
+        name: 'San Francisco',
+        position: Cesium.Cartesian3.fromDegrees(-122.4175, 37.655, 50),
+        point: {
+          pixelSize: 10,
+          color: Cesium.Color.CYAN,
+          outlineColor: Cesium.Color.WHITE,
+          outlineWidth: 2
+        },
+        label: {
+          text: 'San Francisco',
+          font: '14pt sans-serif',
+          fillColor: Cesium.Color.WHITE,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          pixelOffset: new Cesium.Cartesian2(0, -9)
+        }
+      });
+
+      // Grand Canyon marker
+      viewer.entities.add({
+        name: 'Grand Canyon',
+        position: Cesium.Cartesian3.fromDegrees(-112.1401, 36.0544, 100),
+        point: {
+          pixelSize: 10,
+          color: Cesium.Color.ORANGE,
+          outlineColor: Cesium.Color.WHITE,
+          outlineWidth: 2
+        },
+        label: {
+          text: 'Grand Canyon',
+          font: '14pt sans-serif',
+          fillColor: Cesium.Color.WHITE,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          pixelOffset: new Cesium.Cartesian2(0, -9)
+        }
+      });
+    }
+
+    async function initSparkInCesium(cesiumViewer) {
+      console.log('✨ Initializing Spark 3DGS (in Cesium scene)...');
+
+      const THREE = await import('three');
+      const { SplatMesh, SparkRenderer } = await import('@sparkjsdev/spark');
+
+      // Shared WebGL context & canvas: lets Spark/Three render into the same depth buffer.
+      const gl = cesiumViewer.scene.context._gl;
+      const canvas = cesiumViewer.scene.canvas;
+
+      const renderer = new THREE.WebGLRenderer({
+        canvas,
+        context: gl,
+        alpha: true,
+        antialias: true
+      });
+      renderer.autoClear = false;
+      renderer.setClearAlpha(0);
+      renderer.setPixelRatio(1);
+
+      const scene = new THREE.Scene();
+
+      // We'll render with Cesium's projection matrix; keep the Three camera at identity.
+      const camera = new THREE.PerspectiveCamera();
+      camera.matrixAutoUpdate = false;
+
+      // Spark renderer (required to render SplatMesh instances)
+      const sparkRenderer = new SparkRenderer({ renderer });
+      sparkRenderer.frustumCulled = false;
+      scene.add(sparkRenderer);
+
+      const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
+      scene.add(ambientLight);
+
+      // Local 3DGS asset (moved from repo root to assets/3dgs)
+      const splatURL = "./assets/3dgs/JNUAerial-with_Park-y_up.sog";
+      //const splatURL = "./assets/3dgs/batterybox_staticcam_bgr.ply";
+      
+      const splat = new SplatMesh({ url: splatURL });
+      splat.frustumCulled = false;
+
+      // World scale in meters (tune if you want it bigger/smaller on the globe)
+      // 说明：本仓库的 .sog 模型通常已经是“米”尺度，默认用 1.0
+      scene.add(splat);
+
+      console.log('✓ Spark 3DGS splat loaded');
+
+      // Place the splat at a fixed geo position, clamped to terrain as it loads.
+      // 暨南大学珠海校区（Jinan University, Zhuhai Campus）
+      // 坐标来源：OpenStreetMap 聚合站点（可能存在少量偏差，可按需微调）
+      const splatState = {
+        // Default transform (updated from your last interactive tweaks)
+        lon: 113.52964,
+        lat: 22.25333,
+        // “上空”高度（相对地面抬高的米数）
+        heightOffsetMeters: 80.0,
+        // ENU offsets (meters), useful for fine-tuning on top of the lat/lon anchor.
+        eastMeters: 0.0,
+        northMeters: 0.0,
+        upMeters: 0.0,
+        // Rotation relative to local ENU frame.
+        headingDeg: 290.0,
+        pitchDeg: 0.0,
+        rollDeg: 90.0,
+        // Uniform scale in "world meters".
+        scale: 57.0
+      };
+
+      const splatCartographic = new Cesium.Cartographic();
+      // Height (meters above ellipsoid). We'll continuously sample terrain height and
+      // smooth updates to avoid “跳动/跟不上” when terrain tiles refine.
+      let splatHeightMeters = splatState.heightOffsetMeters;
+      let splatHeightTargetMeters = null;
+      let lastPostRenderTimeMs = performance.now();
+
+      const modelMatrixEcef = new Cesium.Matrix4();
+      const modelMatrixEcefRotated = new Cesium.Matrix4();
+      const modelMatrixEcefScaled = new Cesium.Matrix4();
+      const enuFrame = new Cesium.Matrix4();
+      const scratchPosition = new Cesium.Cartesian3();
+      const scratchPositionWithOffset = new Cesium.Cartesian3();
+      const scratchOffsetEnu = new Cesium.Cartesian3();
+      const scratchOffsetEcef = new Cesium.Cartesian3();
+      const scratchRotation3 = new Cesium.Matrix3();
+      const scratchRotation4 = new Cesium.Matrix4();
+      const scratchScaleMatrix = new Cesium.Matrix4();
+      const scratchModelView = new Cesium.Matrix4();
+      const scratchArray16 = new Float64Array(16);
+      const scratchSphereCenter = new Cesium.Cartesian3();
+
+      function updateSplatModelMatrixEcef(dtSeconds) {
+        splatCartographic.longitude = Cesium.Math.toRadians(splatState.lon);
+        splatCartographic.latitude = Cesium.Math.toRadians(splatState.lat);
+        splatCartographic.height = 0.0;
+
+        const height = cesiumViewer.scene.globe.getHeight(splatCartographic);
+        if (typeof height === 'number' && Number.isFinite(height)) {
+          const nextTarget = height + splatState.heightOffsetMeters;
+          // First valid height: snap to avoid long “漂浮”
+          if (splatHeightTargetMeters === null) {
+            splatHeightMeters = nextTarget;
+          }
+          splatHeightTargetMeters = nextTarget;
+        }
+
+        // Smooth height changes as terrain refines.
+        if (splatHeightTargetMeters !== null) {
+          if (typeof dtSeconds === "number" && Number.isFinite(dtSeconds) && dtSeconds > 0) {
+            const timeConstantSeconds = 0.15;
+            const alpha = 1.0 - Math.exp(-dtSeconds / timeConstantSeconds);
+            splatHeightMeters = Cesium.Math.lerp(
+              splatHeightMeters,
+              splatHeightTargetMeters,
+              Cesium.Math.clamp(alpha, 0.0, 1.0)
+            );
+          } else {
+            // If called without dt (e.g. from UI), just use the latest sampled height.
+            splatHeightMeters = splatHeightTargetMeters;
+          }
+        }
+
+        const position = Cesium.Cartesian3.fromDegrees(
+          splatState.lon,
+          splatState.lat,
+          splatHeightMeters,
+          Cesium.Ellipsoid.WGS84,
+          scratchPosition
+        );
+
+        // Anchor frame at the (lon,lat,height) point.
+        Cesium.Transforms.eastNorthUpToFixedFrame(position, Cesium.Ellipsoid.WGS84, enuFrame);
+
+        // Apply ENU offset in meters.
+        scratchOffsetEnu.x = splatState.eastMeters;
+        scratchOffsetEnu.y = splatState.northMeters;
+        scratchOffsetEnu.z = splatState.upMeters;
+        Cesium.Matrix4.multiplyByPointAsVector(enuFrame, scratchOffsetEnu, scratchOffsetEcef);
+        Cesium.Cartesian3.add(position, scratchOffsetEcef, scratchPositionWithOffset);
+
+        Cesium.Transforms.eastNorthUpToFixedFrame(
+          scratchPositionWithOffset,
+          Cesium.Ellipsoid.WGS84,
+          modelMatrixEcef
+        );
+
+        // Apply local rotation (heading/pitch/roll) relative to ENU.
+        Cesium.Matrix3.fromHeadingPitchRoll(
+          new Cesium.HeadingPitchRoll(
+            Cesium.Math.toRadians(splatState.headingDeg),
+            Cesium.Math.toRadians(splatState.pitchDeg),
+            Cesium.Math.toRadians(splatState.rollDeg)
+          ),
+          scratchRotation3
+        );
+        Cesium.Matrix4.fromRotationTranslation(scratchRotation3, Cesium.Cartesian3.ZERO, scratchRotation4);
+        Cesium.Matrix4.multiply(modelMatrixEcef, scratchRotation4, modelMatrixEcefRotated);
+
+        // Bake scale into the matrix (we overwrite splat.matrix each frame).
+        Cesium.Matrix4.fromUniformScale(splatState.scale, scratchScaleMatrix);
+        Cesium.Matrix4.multiply(modelMatrixEcefRotated, scratchScaleMatrix, modelMatrixEcefScaled);
+      }
+
+      updateSplatModelMatrixEcef();
+
+      // Make a helper so UI can jump to the splat.
+      const flyToSplatFn = function() {
+        updateSplatModelMatrixEcef();
+        const center = Cesium.Matrix4.getTranslation(modelMatrixEcef, scratchSphereCenter);
+        const radius = Math.max(30.0, 30.0 * splatState.scale);
+        const sphere = new Cesium.BoundingSphere(center, radius);
+        cesiumViewer.camera.flyToBoundingSphere(sphere, {
+          offset: new Cesium.HeadingPitchRange(
+            Cesium.Math.toRadians(45.0),
+            Cesium.Math.toRadians(-25.0),
+            250.0
+          ),
+          duration: 2.0
+        });
+      };
+      window.flyToSplat = flyToSplatFn;
+
+      // Public API: tweak 3DGS transform at runtime.
+      // Examples:
+      //   setSplatTransform({ scale: 2 })
+      //   setSplatTransform({ lon: 113.5295, lat: 22.252, heightOffsetMeters: 80 })
+      //   setSplatTransform({ eastMeters: 5, northMeters: -2, upMeters: 10 })
+      //   setSplatTransform({ headingDeg: 90, pitchDeg: 0, rollDeg: 0 })
+      window.getSplatTransform = function() {
+        return { ...splatState };
+      };
+      window.setSplatTransform = function(partial) {
+        if (!partial || typeof partial !== "object") return;
+        Object.assign(splatState, partial);
+
+        // If the anchor changes, reset height smoothing target.
+        if (
+          Object.prototype.hasOwnProperty.call(partial, "lon") ||
+          Object.prototype.hasOwnProperty.call(partial, "lat") ||
+          Object.prototype.hasOwnProperty.call(partial, "heightOffsetMeters")
+        ) {
+          splatHeightTargetMeters = null;
+          splatHeightMeters = splatState.heightOffsetMeters;
+        }
+
+        updateSplatModelMatrixEcef();
+        updateDebugInfo();
+      };
+      window.nudgeSplat = function({ eastMeters = 0, northMeters = 0, upMeters = 0 } = {}) {
+        splatState.eastMeters += eastMeters;
+        splatState.northMeters += northMeters;
+        splatState.upMeters += upMeters;
+        updateSplatModelMatrixEcef();
+        updateDebugInfo();
+      };
+      window.rotateSplat = function({ headingDeg = 0, pitchDeg = 0, rollDeg = 0 } = {}) {
+        splatState.headingDeg += headingDeg;
+        splatState.pitchDeg += pitchDeg;
+        splatState.rollDeg += rollDeg;
+        updateSplatModelMatrixEcef();
+        updateDebugInfo();
+      };
+      window.scaleSplat = function(multiplier) {
+        if (typeof multiplier !== "number" || !Number.isFinite(multiplier)) return;
+        splatState.scale *= multiplier;
+        updateSplatModelMatrixEcef();
+        updateDebugInfo();
+      };
+
+      // Render after Cesium so we can reuse its depth buffer.
+      let lastCanvasWidth = 0;
+      let lastCanvasHeight = 0;
+
+      cesiumViewer.scene.postRender.addEventListener(() => {
+        const now = performance.now();
+        const dtSeconds = Math.min(0.25, Math.max(0.0, (now - lastPostRenderTimeMs) / 1000.0));
+        lastPostRenderTimeMs = now;
+
+        // Always update so the 3DGS follows terrain refinement smoothly.
+        updateSplatModelMatrixEcef(dtSeconds);
+
+        const viewMatrix = cesiumViewer.camera.viewMatrix;
+        const projectionMatrix = cesiumViewer.camera.frustum.projectionMatrix;
+        const frustum = cesiumViewer.camera.frustum;
+
+        // Sync projection. (Camera transform stays identity; we push model into view space.)
+        Cesium.Matrix4.toArray(projectionMatrix, scratchArray16);
+        camera.projectionMatrix.fromArray(scratchArray16);
+        camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+        if (typeof frustum?.near === "number" && Number.isFinite(frustum.near)) {
+          camera.near = frustum.near;
+        }
+        if (typeof frustum?.far === "number" && Number.isFinite(frustum.far)) {
+          camera.far = frustum.far;
+        }
+        camera.matrixWorld.identity();
+        camera.matrixWorldInverse.identity();
+
+        // Resize bookkeeping (do NOT change canvas size here).
+        const w = canvas.width;
+        const h = canvas.height;
+        if (w !== lastCanvasWidth || h !== lastCanvasHeight) {
+          lastCanvasWidth = w;
+          lastCanvasHeight = h;
+          renderer.setSize(w, h, false);
+          renderer.setViewport(0, 0, w, h);
+        } else {
+          renderer.setViewport(0, 0, w, h);
+        }
+
+        // Compute modelView = view * model, so the object stays near the origin (better precision).
+        Cesium.Matrix4.multiply(viewMatrix, modelMatrixEcefScaled, scratchModelView);
+        Cesium.Matrix4.toArray(scratchModelView, scratchArray16);
+        splat.matrixAutoUpdate = false;
+        splat.matrix.fromArray(scratchArray16);
+        // Ensure Three propagates the updated matrix every frame.
+        splat.matrixWorldNeedsUpdate = true;
+
+        // Prevent state leakage between engines.
+        if (typeof renderer.resetState === 'function') {
+          renderer.resetState();
+        } else if (renderer.state && typeof renderer.state.reset === 'function') {
+          renderer.state.reset();
+        }
+
+        renderer.render(scene, camera);
+
+        if (typeof renderer.resetState === 'function') {
+          renderer.resetState();
+        } else if (renderer.state && typeof renderer.state.reset === 'function') {
+          renderer.state.reset();
+        }
+      });
+
+      return { renderer, scene, camera, splat };
+    }
+
+    // Camera control functions
+    window.flyToSanFrancisco = function() {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(-122.4175, 37.655, 400),
+        orientation: {
+          heading: Cesium.Math.toRadians(0.0),
+          pitch: Cesium.Math.toRadians(-15.0),
+          roll: 0.0
+        },
+        duration: 2
+      });
+    };
+
+    window.flyToGrandCanyon = function() {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(-112.1401, 36.0544, 5000),
+        orientation: {
+          heading: Cesium.Math.toRadians(0.0),
+          pitch: Cesium.Math.toRadians(-45.0),
+          roll: 0.0
+        },
+        duration: 2
+      });
+    };
+
+    window.flyToEverest = function() {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(86.9250, 27.9881, 10000),
+        orientation: {
+          heading: Cesium.Math.toRadians(45.0),
+          pitch: Cesium.Math.toRadians(-30.0),
+          roll: 0.0
+        },
+        duration: 2
+      });
+    };
+
+    window.flyToAlps = function() {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(7.7586, 46.0207, 5000),
+        orientation: {
+          heading: Cesium.Math.toRadians(0.0),
+          pitch: Cesium.Math.toRadians(-40.0),
+          roll: 0.0
+        },
+        duration: 2
+      });
+    };
+
+    window.flyToNewYork = function() {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(-74.0060, 40.7128, 500),
+        orientation: {
+          heading: Cesium.Math.toRadians(0.0),
+          pitch: Cesium.Math.toRadians(-20.0),
+          roll: 0.0
+        },
+        duration: 2
+      });
+    };
+
+    window.toggleLighting = function() {
+      if (viewer) {
+        viewer.scene.globe.enableLighting = !viewer.scene.globe.enableLighting;
+        console.log('Globe lighting:', viewer.scene.globe.enableLighting);
+        updateDebugInfo();
+      }
+    };
+
+    window.cycleImagery = async function() {
+      if (!viewer) return;
+      
+      // 循环切换影像源
+      currentImageryIndex = (currentImageryIndex + 1) % CN_IMAGERY_SOURCES.length;
+      const selected = CN_IMAGERY_SOURCES[currentImageryIndex];
+      
+      console.log('Switching to:', selected.name);
+      
+      try {
+        const provider = await createImageryProvider(selected);
+        setBaseImageryProvider(provider);
+        
+        console.log('✓ Switched to', selected.name);
+        updateDebugInfo();
+      } catch (error) {
+        console.error('Failed to load', selected.name, error);
+      }
+    };
+
+    window.cycleTerrain = async function() {
+      if (!viewer) return;
+      const next = (currentTerrainIndex + 1) % TERRAIN_SOURCES.length;
+      await setTerrainByIndex(next);
+    };
+
+    // Initialize both systems
+    async function initApplication() {
+      try {
+        await waitForCesium();
+
+        const cesiumViewer = await initCesium();
+        await initSparkInCesium(cesiumViewer);
+
+        // Ensure initial view points at the 3DGS asset.
+        if (typeof window.flyToSplat === 'function') {
+          window.flyToSplat();
+        }
+        
+        console.log('🎉 所有系统已成功加载！');
+        console.log('提示：如果地形仍显示蓝色，请点击"切换影像源"按钮');
+        
+      } catch (error) {
+        console.error('❌ Failed to initialize application:', error);
+        const loadingInfo = document.getElementById('loadingInfo');
+        if (loadingInfo) {
+          loadingInfo.textContent = '加载失败: ' + error.message;
+          loadingInfo.style.color = '#ff6b6b';
+        }
+      }
+    }
+
+    initApplication();
+  </script>
+</body>
+</html>
